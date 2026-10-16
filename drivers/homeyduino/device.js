@@ -69,6 +69,13 @@ class HomeyduinoDevice extends Homey.Device {
             this.ipAddress = '0.0.0.0';
         }
 
+        if (typeof settings.offline_timeout === 'number' && !Number.isNaN(settings.offline_timeout)) {
+            this.offlineTimeout = settings.offline_timeout;
+        } else {
+            this.offlineTimeout = 60;
+        }
+        this._offlineTimer = null;
+
         this.trigger = {};
         this.trigger.debug = this.homey.flow.getDeviceTriggerCard("debug_trigger");
         this.trigger.number = this.homey.flow.getDeviceTriggerCard("number_trigger");
@@ -91,6 +98,7 @@ class HomeyduinoDevice extends Homey.Device {
         this._rcAnalogInputPins = [];
 
         this.listening = false;
+        await this._setupOfflineWatchdog();
         this.deviceInit();
     }
 
@@ -100,10 +108,92 @@ class HomeyduinoDevice extends Homey.Device {
     }
 
     onDeleted() {
+        this._clearOfflineWatchdog();
         this.removeListeners();
         if (this.device && !(this.device instanceof Error)) {
             this.device.setOpt('paired', false);
             this.device.unsubscribe();
+        }
+    }
+
+    async onUninit() {
+        this._clearOfflineWatchdog();
+        this.removeListeners();
+    }
+
+    async _setupOfflineWatchdog() {
+        this._clearOfflineWatchdog();
+
+        if (this.offlineTimeout > 0) {
+            if (!this.hasCapability('alarm_generic')) {
+                try {
+                    await this.addCapability('alarm_generic');
+                    this.log('Added alarm_generic capability for offline watchdog');
+                } catch (err) {
+                    this.log('Could not add alarm_generic capability:', err.message || err);
+                }
+            }
+            if (this.hasCapability('alarm_generic') && !this._capabilities.includes('alarm_generic')) {
+                await this.setCapabilityOptions('alarm_generic', {
+                    title: {
+                        en: 'Offline alarm',
+                        nl: 'Offline alarm',
+                        no: 'Frakoblet-alarm'
+                    }
+                }).catch(err => {
+                    this.log('Could not set capability options for alarm_generic:', err.message || err);
+                });
+                if (this.getCapabilityValue('alarm_generic') === null) {
+                    await this.setCapabilityValue('alarm_generic', false).catch(err => {
+                        this.log('Could not initialize alarm_generic value:', err.message || err);
+                    });
+                }
+            }
+            this._resetOfflineWatchdog();
+        } else {
+            if (this.hasCapability('alarm_generic') && !this._capabilities.includes('alarm_generic')) {
+                try {
+                    await this.removeCapability('alarm_generic');
+                    this.log('Removed alarm_generic capability (offline watchdog disabled)');
+                } catch (err) {
+                    this.log('Could not remove alarm_generic capability:', err.message || err);
+                }
+            }
+        }
+    }
+
+    _clearOfflineWatchdog() {
+        if (this._offlineTimer) {
+            this.homey.clearTimeout(this._offlineTimer);
+            this._offlineTimer = null;
+        }
+    }
+
+    _resetOfflineWatchdog() {
+        this._clearOfflineWatchdog();
+        if (!this.offlineTimeout || this.offlineTimeout <= 0) return;
+
+        const timeoutMs = this.offlineTimeout * 60 * 1000;
+        this._offlineTimer = this.homey.setTimeout(() => {
+            this._offlineTimer = null;
+            this.log(`No values received for ${this.offlineTimeout} minute(s). Raising offline alarm.`);
+            if (this.hasCapability('alarm_generic')) {
+                this.setCapabilityValue('alarm_generic', true).catch(err => {
+                    this.log('Could not set offline alarm:', err.message || err);
+                });
+            }
+        }, timeoutMs);
+    }
+
+    _onValueReceived() {
+        if (!this.offlineTimeout || this.offlineTimeout <= 0) return;
+        this._resetOfflineWatchdog();
+        if (this.hasCapability('alarm_generic') && !this._capabilities.includes('alarm_generic')) {
+            if (this.getCapabilityValue('alarm_generic') !== false) {
+                this.setCapabilityValue('alarm_generic', false).catch(err => {
+                    this.log('Could not clear offline alarm:', err.message || err);
+                });
+            }
         }
     }
 
@@ -295,15 +385,12 @@ class HomeyduinoDevice extends Homey.Device {
         }
     }
 
-    getCapabilities() {
-        return this._capabilities;
-    }
-
     updateCapabilityValue(capability) {
         if (!this.device || typeof this.device.query !== 'function') return;
         this.device.query(capability, 'cap', '', true).then((value) => {
             if (typeof value !== "undefined") {
                 this.log("Set initial capability value of", capability, "to", typeof value, value);
+                this._onValueReceived();
                 if (this.hasCapability(capability)) {
                     this.setCapabilityValue(capability, value).catch((err) => {
                         this.log("Could not set initial capability value:", err.message || err);
@@ -490,13 +577,16 @@ class HomeyduinoDevice extends Homey.Device {
         if (!info) return;
         if (info.emType === 'trg') {
             this.log("Trigger emit received:", info.name, info.type, info.argument);
+            this._onValueReceived();
             this.onTriggered(info);
             this.onRcEmit(info);
         } else if (info.emType === 'rc') {
             this.log("RC emit received:", info.name, info.type, info.argument);
+            this._onValueReceived();
             this.onRcEmit(info);
         } else if (info.emType === 'cap') {
             this.log("Capability emit received:", info.name, info.type, info.argument);
+            this._onValueReceived();
             if (this.hasCapability(info.name)) {
                 this.setCapabilityValue(info.name, info.argument).catch((err) => {
                     this.log("Could not set capability value:", err.message || err);
@@ -720,6 +810,14 @@ class HomeyduinoDevice extends Homey.Device {
         if (oldSettings.ip !== newSettings.ip) {
             this.log('IP address changed to', newSettings.ip);
             this.ipAddress = newSettings.ip;
+        }
+
+        if (oldSettings.offline_timeout !== newSettings.offline_timeout) {
+            this.log('Offline timeout changed to', newSettings.offline_timeout);
+            this.offlineTimeout = (typeof newSettings.offline_timeout === 'number' && !Number.isNaN(newSettings.offline_timeout))
+                ? newSettings.offline_timeout
+                : 0;
+            await this._setupOfflineWatchdog();
         }
 
         if (typeof newSettings.rc !== 'undefined') {
